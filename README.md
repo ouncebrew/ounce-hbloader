@@ -1,17 +1,13 @@
-# nx-hbloader for Switch 2
+# hbloader for Switch 2
 
-The homebrew loader for Switch 2. kaiHEN runs it in a game process: it
+based on nx-hbloader
+
+The homebrew loader for Switch 2. kaiHEN runs it in a game process, it
 starts hbmenu (`sdmc:/hbmenu.nro`), runs the program you pick, and returns to
 hbmenu when the program exits.
 
-Programs get the same environment as with upstream nx-hbloader, so libnx
-homebrew runs as usual. The loader also cleans up after programs that exit
-without tidying up, such as threads that SDL leaves running, so the next
-program starts clean. If something cannot be cleaned up safely, it ends the
-game process instead. What the last program left behind is written to
-`/kaihen/nro-cleanup.txt`.
-
-Based on nx-hbloader 82b9512. The Switch 1 loader is not included.
+Programs get the same environment as with nx-hbloader, so libnx
+homebrew runs as usual. The loader does additional cleanup after NRO exits.
 
 ## Build
 
