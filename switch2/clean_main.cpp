@@ -118,7 +118,10 @@ struct CleanPlatform {
     char loaded_path[HBLOADER_NEXT_PATH_BYTES] = {};
     Handle process = INVALID_HANDLE;
     Handle sm = INVALID_HANDLE;
+    Handle loader_root = INVALID_HANDLE;
     Handle nro_root = INVALID_HANDLE;
+    // The loaded NRO carries libounce's Switch 2 mark.
+    bool switch2_program = false;
     u8* staging = nullptr;
     size_t capacity = 0;
     size_t occupied = 0;
@@ -130,6 +133,9 @@ struct CleanPlatform {
         }
         if (sm != INVALID_HANDLE) {
             svcCloseHandle(sm);
+        }
+        if (loader_root != INVALID_HANDLE) {
+            svcCloseHandle(loader_root);
         }
         if (sd.s.session != INVALID_HANDLE) {
             fsFsClose(&sd);
@@ -149,6 +155,12 @@ Result mapImage(void* opaque, const char* path, HbloaderMappedImage* out) {
         return rc;
     }
 
+    // libounce's startup code marks the platform an NRO was built for, as
+    // hbmenu checks before a launch. Upstream libnx programs have no mark.
+    NroOunceInfo ounce = {};
+    platform->switch2_program =
+        nroGetOunceInfo(platform->staging, header.size, &ounce) &&
+        ounce.platform == NroPlatform_Switch2;
     platform->occupied = pageAlign(static_cast<size_t>(header.size) + header.bss_size);
     if (platform->occupied >= platform->capacity) {
         return MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
@@ -582,6 +594,19 @@ Result prepareConfig(void* opaque, HbloaderConfigInput* out) {
         return sm_rc;
     }
     out->sm_handle = platform->sm;
+    // A Switch 2 program gets a clone of HEN's fsp-ldr root as its fsp-ldr
+    // override; libounce does not send SetCurrentProcess on it. An upstream
+    // libnx program sends SetCurrentProcess on fsp-ldr, which would rebind
+    // the root that every clone shares, so it gets no override and asks SM.
+    if (platform->loader_root != INVALID_HANDLE) {
+        svcCloseHandle(platform->loader_root);
+        platform->loader_root = INVALID_HANDLE;
+    }
+    if (platform->switch2_program &&
+        R_FAILED(henGetLoaderRoot(platform->hen, &platform->loader_root))) {
+        platform->loader_root = INVALID_HANDLE;
+    }
+    out->fs_ldr_handle = platform->loader_root;
     // No debug BSD session: the NRO is the process's only BSD client.
     out->debug_bsd_handle = INVALID_HANDLE;
     out->debug_socket = -1;

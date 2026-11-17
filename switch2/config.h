@@ -15,7 +15,7 @@ typedef struct HbloaderConfigEntry {
 } HbloaderConfigEntry;
 
 enum {
-    HBLOADER_CONFIG_ENTRY_COUNT = 17,
+    HBLOADER_CONFIG_ENTRY_COUNT = 18,
     HBLOADER_ENTRY_MAIN_THREAD = 1,
     HBLOADER_ENTRY_NEXT_LOAD = 2,
     HBLOADER_ENTRY_OVERRIDE_HEAP = 3,
@@ -48,6 +48,7 @@ enum {
 #define HBLOADER_FSP_SRV_NAME UINT64_C(0x007672732d707366)
 #define HBLOADER_LDR_RO_NAME UINT64_C(0x00006f723a72646c)
 #define HBLOADER_SM_NAME UINT64_C(0x00000000003a6d73)
+#define HBLOADER_FSP_LDR_NAME UINT64_C(0x0072646c2d707366)
 
 typedef struct HbloaderConfigInput {
     uint32_t main_thread_handle;
@@ -55,6 +56,8 @@ typedef struct HbloaderConfigInput {
     uint32_t fs_root_handle;
     uint32_t ro_handle;
     uint32_t sm_handle;
+    /* A clone of HEN's fsp-ldr root for a Switch 2 program, or 0. */
+    uint32_t fs_ldr_handle;
     uint32_t debug_bsd_handle;
     int32_t debug_socket;
     uint64_t heap_address;
