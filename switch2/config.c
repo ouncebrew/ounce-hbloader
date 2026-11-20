@@ -54,15 +54,19 @@ int hbloaderSwitch2BuildConfig(const HbloaderConfigInput *input,
          {HBLOADER_SM_NAME, input->sm_handle}},
         {HBLOADER_ENTRY_OVERRIDE_SERVICE, 0,
          {HBLOADER_FSP_LDR_NAME, input->fs_ldr_handle}},
+        {HBLOADER_ENTRY_MODULES, 0, {input->modules_info, 0}},
         {HBLOADER_ENTRY_END,
          0,
          {(uint64_t)(uintptr_t)input->notice, input->notice_size}},
     };
     /* As upstream, a service override is passed only for a session the
-     * loader holds; the entries after it move up and END stays last. */
+     * loader holds; the entries after it move up and END stays last. The
+     * module entry is passed only for a dynamically linked program. */
     size_t count = 0;
     for (size_t i = 0; i < HBLOADER_CONFIG_ENTRY_COUNT; ++i) {
         if (built[i].key == HBLOADER_ENTRY_OVERRIDE_SERVICE && !built[i].value[1])
+            continue;
+        if (built[i].key == HBLOADER_ENTRY_MODULES && !built[i].value[0])
             continue;
         entries[count++] = built[i];
     }

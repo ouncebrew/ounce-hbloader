@@ -15,7 +15,7 @@ typedef struct HbloaderConfigEntry {
 } HbloaderConfigEntry;
 
 enum {
-    HBLOADER_CONFIG_ENTRY_COUNT = 18,
+    HBLOADER_CONFIG_ENTRY_COUNT = 19,
     HBLOADER_ENTRY_MAIN_THREAD = 1,
     HBLOADER_ENTRY_NEXT_LOAD = 2,
     HBLOADER_ENTRY_OVERRIDE_HEAP = 3,
@@ -33,6 +33,10 @@ enum {
      * The clean loader passes it empty (handle 0, socket -1): it holds no
      * BSD client while an NRO runs. Readers look it up by its key. */
     HBLOADER_ENTRY_DEBUG_BSD = 0x4f444247,
+    /* libounce's DYNLINK_CONFIG_ENTRY_KEY: the images of a dynamically linked
+     * program, for the runtime library that the loader enters. Value[0] is
+     * the address of a DynlinkLoadInfo. */
+    HBLOADER_ENTRY_MODULES = 0x4f4d4f44,
     HBLOADER_ENTRY_END = 0,
     HBLOADER_ENTRY_MANDATORY = 1,
     HBLOADER_APPLET_TYPE_LIBRARY_APPLET = 2,
@@ -71,6 +75,8 @@ typedef struct HbloaderConfigInput {
     void *user_id_storage;
     uint32_t hos_version;
     uint8_t is_application;
+    /* The DynlinkLoadInfo of a dynamically linked program, or 0. */
+    uint64_t modules_info;
     const char *notice;
     size_t notice_size;
 } HbloaderConfigInput;
@@ -78,8 +84,9 @@ typedef struct HbloaderConfigInput {
 /* Builds the upstream homebrew ABI entry order for one NRO launch. Every
  * pointer in the input and output must remain live until the NRO returns.
  * Runtime acquisition of handles, heap and firmware fields is separate.
- * A service override with handle 0 is omitted. The NRO opens other
- * services, such as set:sys, through the sm override.
+ * A service override with handle 0 is omitted, and so is the module entry
+ * of a statically linked program. The NRO opens other services, such as
+ * set:sys, through the sm override.
  * The NRO opens the SD card through its own clone of the fsp-srv root, so
  * that the files it leaves open close when it closes that session. */
 int hbloaderSwitch2BuildConfig(const HbloaderConfigInput *input,
