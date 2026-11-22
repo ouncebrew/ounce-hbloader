@@ -52,8 +52,8 @@ HbloaderCycleResult hbloaderSwitch2Step(HbloaderCycle *cycle,
         cycle->has_mapping = 0;
     }
 
-    if (!cycle->next_path[0] &&
-        hbloaderSwitch2Select(cycle, default_menu_path, default_menu_path))
+    const int is_menu = !cycle->next_path[0];
+    if (is_menu && hbloaderSwitch2Select(cycle, default_menu_path, default_menu_path))
         return (HbloaderCycleResult){HBLOADER_CYCLE_INVALID, 0};
 
     for (size_t i = 0; i < sizeof cycle->argv; ++i)
@@ -61,6 +61,14 @@ HbloaderCycleResult hbloaderSwitch2Step(HbloaderCycle *cycle,
 
     HbloaderMappedImage mapped = {0};
     uint32_t result = platform->map_image(platform->context, cycle->next_path, &mapped);
+    if (result && !is_menu) {
+        /* A program that cannot be loaded, for example one whose shared
+         * library is missing, does not end the process: the next step loads
+         * the menu, which gets the failure as the last result. */
+        cycle->next_path[0] = 0;
+        cycle->last_result = result;
+        return (HbloaderCycleResult){HBLOADER_CYCLE_OK, result};
+    }
     if (result)
         return (HbloaderCycleResult){HBLOADER_CYCLE_MAP, result};
     if (!mapped.entry || !mapped.owner)
