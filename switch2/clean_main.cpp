@@ -242,17 +242,25 @@ Result loadImage(CleanPlatform* platform, const char* path, u64* out_size) {
     return 0;
 }
 
-// Unloads the program's images, the libraries first. An image that cannot be
-// unloaded stays recorded with those before it.
-Result unloadImages() {
-    while (g_images.count != 0) {
-        const Result rc = ldrRoUnloadNro(g_images.loaded[g_images.count - 1].base);
-        if (R_FAILED(rc)) {
-            return rc;
-        }
-        g_images.count--;
-    }
-    return 0;
+// NROs that a program mapped itself and left: for the last program, and for
+// all programs of this process. RO unloaded them with the loader's own.
+u32 g_last_left_images = 0;
+u32 g_left_images = 0;
+
+// Unloads every NRO of the loader's RO session with one command: the
+// program, the libraries that the loader mapped for it, and the ones that
+// the program mapped itself and did not unload. The program uses the
+// loader's session, so RO has them all in one list. An image that RO cannot
+// unmap stays mapped, and the result is that failure.
+// @param[out] out_unloaded The number of NROs that RO unloaded.
+Result unloadImages(u64* out_unloaded) {
+    const u64 pid_placeholder = 0;
+    *out_unloaded = 0;
+    const Result rc = serviceDispatchInOut(ldrRoGetServiceSession(),
+                                           KaihenRoCommand_ReleaseNros,
+                                           pid_placeholder, *out_unloaded, .in_send_pid = true);
+    g_images.count = 0;
+    return rc;
 }
 
 bool isLibraryLoaded(const char* soname) {
@@ -470,7 +478,8 @@ Result mapImage(void* opaque, const char* path, HbloaderMappedImage* out) {
     const Result rc = loadProgram(platform, path, &entry);
     if (R_FAILED(rc)) {
         writeLoadFailure(&platform->sd, path, rc);
-        unloadImages();
+        u64 unloaded = 0;
+        unloadImages(&unloaded);
         return rc;
     }
     out->entry = entry;
@@ -599,6 +608,11 @@ void writeCleanupStatus(FsFileSystem* sd, const char* program, const HbloaderLea
         length += std::snprintf(text + length, sizeof(text) - length,
             "ended threads the program did not close (released by the loader): %u\n",
             g_closed_thread_handles);
+    }
+    if (length > 0 && length < static_cast<int>(sizeof(text)) && g_left_images != 0) {
+        length += std::snprintf(text + length, sizeof(text) - length,
+            "shared libraries the program left loaded (unloaded by the loader): %u, %u in this process\n",
+            g_last_left_images, g_left_images);
     }
     if (length <= 0 || length >= static_cast<int>(sizeof(text))) {
         return;
@@ -894,7 +908,13 @@ Result unloadImage(void* opaque, const HbloaderMappedImage*) {
         return rc;
     }
 
-    rc = unloadImages();
+    // What RO unloads beyond the loader's own images is what the program
+    // mapped and left.
+    const u64 loaded_by_loader = g_images.count;
+    u64 unloaded = 0;
+    rc = unloadImages(&unloaded);
+    g_last_left_images = unloaded > loaded_by_loader ? static_cast<u32>(unloaded - loaded_by_loader) : 0;
+    g_left_images += g_last_left_images;
     if (R_SUCCEEDED(rc)) {
         checkAfterReturn(platform);
     }
