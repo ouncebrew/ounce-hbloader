@@ -307,7 +307,9 @@ bool findLibrary(CleanPlatform* platform, const char* soname, char* path, size_t
 
 // Loads the shared libraries that the loaded images need, and the ones those
 // need. Each image is examined once, in the order it was loaded, so the
-// libraries are in breadth-first order.
+// libraries are in breadth-first order. A failure is one of libounce's
+// results for a program that did not start (dynlink.h), which the menu shows:
+// the reason, with the library's name, is in the message.
 Result loadLibraries(CleanPlatform* platform) {
     for (u32 index = 0; index < g_images.count; index++) {
         for (u32 needed = 0; needed < g_images.parsed[index].needed_count; needed++) {
@@ -319,21 +321,21 @@ Result loadLibraries(CleanPlatform* platform) {
             if (!findLibrary(platform, soname, path, sizeof(path))) {
                 std::snprintf(g_images.message, sizeof(g_images.message),
                               "shared library not found: %s", soname);
-                return MAKERESULT(Module_Libnx, LibnxError_NotFound);
+                return DYNLINK_RESULT_LIBRARY_NOT_FOUND;
             }
             u64 size = 0;
             const Result rc = loadImage(platform, path, &size);
             if (R_FAILED(rc)) {
                 std::snprintf(g_images.message, sizeof(g_images.message),
                               "shared library %s could not be loaded: 0x%x", soname, rc);
-                return rc;
+                return DYNLINK_RESULT_LIBRARY_NOT_LOADED;
             }
             // The file must be the library it is named for, or the search
             // above would load it again for the next module that needs it.
             if (!isLibraryLoaded(soname)) {
                 std::snprintf(g_images.message, sizeof(g_images.message),
                               "the file of shared library %s has another DT_SONAME", soname);
-                return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+                return DYNLINK_RESULT_LIBRARY_NOT_LOADED;
             }
         }
     }
@@ -413,6 +415,7 @@ Result loadPreloads(CleanPlatform* platform) {
         if (R_FAILED(rc)) {
             std::snprintf(g_images.message, sizeof(g_images.message),
                           "preload library %.180s could not be loaded: 0x%x", names[index], rc);
+            rc = DYNLINK_RESULT_PRELOAD_NOT_LOADED;
         }
     }
     std::free(names);
@@ -459,7 +462,7 @@ Result loadProgram(CleanPlatform* platform, const char* path, u64* out_entry) {
     }
     std::snprintf(g_images.message, sizeof(g_images.message),
                   "none of the program's shared libraries is the runtime library (libounce.so)");
-    return MAKERESULT(Module_Libnx, LibnxError_BadInput);
+    return DYNLINK_RESULT_NO_RUNTIME_LIBRARY;
 }
 
 void writeLoadFailure(FsFileSystem* sd, const char* program, Result rc);
