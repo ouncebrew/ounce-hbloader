@@ -2,6 +2,7 @@
 // Game-role NRO loader. The entry/config cycle follows nx-hbloader at
 // 82b95122c5ae8dc059bf23893ba7623c72c86773; see ../LICENSE.md.
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include <switch.h>
@@ -155,9 +156,12 @@ struct CleanPlatform {
 // dynamically linked program, the shared libraries it needs, breadth-first.
 // libounce's runtime library (libounce.so) links them; see its dynlink.h.
 struct ProgramImages {
-    DynlinkLoadedModule loaded[DYNLINK_MAX_MODULES];
-    DynlinkModule parsed[DYNLINK_MAX_MODULES];
+    // Two arrays of the same length, which grow as a program needs more
+    // libraries: the images, and what the loader read from each.
+    DynlinkLoadedModule* loaded;
+    DynlinkModule* parsed;
     u32 count;
+    u32 capacity;
     // What the runtime library gets: the images, and the buffer where it
     // writes why linking failed. The loader also writes there why it could
     // not load a library.
@@ -166,11 +170,34 @@ struct ProgramImages {
 };
 ProgramImages g_images;
 
+// Makes room for one more image in the two arrays. False when the loader has
+// no memory for them.
+bool reserveImage() {
+    if (g_images.count < g_images.capacity) {
+        return true;
+    }
+    const u32 capacity = g_images.capacity != 0 ? g_images.capacity * 2 : 16;
+    auto* const loaded = static_cast<DynlinkLoadedModule*>(
+        std::realloc(g_images.loaded, capacity * sizeof(DynlinkLoadedModule)));
+    if (loaded == nullptr) {
+        return false;
+    }
+    g_images.loaded = loaded;
+    auto* const parsed = static_cast<DynlinkModule*>(
+        std::realloc(g_images.parsed, capacity * sizeof(DynlinkModule)));
+    if (parsed == nullptr) {
+        return false;
+    }
+    g_images.parsed = parsed;
+    g_images.capacity = capacity;
+    return true;
+}
+
 // Reads an NRO file into the staging memory after the images that are
 // already there, and maps it. The image's size without its BSS is in
 // out_size.
 Result loadImage(CleanPlatform* platform, const char* path, u64* out_size) {
-    if (g_images.count == DYNLINK_MAX_MODULES) {
+    if (!reserveImage()) {
         return MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
     }
     u8* const staging = platform->staging + platform->occupied;
@@ -263,7 +290,7 @@ bool findLibrary(CleanPlatform* platform, const char* soname, char* path, size_t
 Result loadLibraries(CleanPlatform* platform) {
     for (u32 index = 0; index < g_images.count; index++) {
         for (u32 needed = 0; needed < g_images.parsed[index].needed_count; needed++) {
-            const char* const soname = g_images.parsed[index].needed[needed];
+            const char* const soname = dynlinkModuleGetNeeded(&g_images.parsed[index], needed);
             if (isLibraryLoaded(soname)) {
                 continue;
             }
@@ -336,7 +363,10 @@ void writeLoadFailure(FsFileSystem* sd, const char* program, Result rc);
 Result mapImage(void* opaque, const char* path, HbloaderMappedImage* out) {
     auto* platform = static_cast<CleanPlatform*>(opaque);
     std::snprintf(platform->loaded_path, sizeof(platform->loaded_path), "%s", path);
-    g_images = ProgramImages{};
+    // The arrays keep their memory from one program to the next.
+    g_images.count = 0;
+    g_images.info = DynlinkLoadInfo{};
+    g_images.message[0] = '\0';
     platform->occupied = 0;
 
     u64 entry = 0;
