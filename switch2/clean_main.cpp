@@ -22,6 +22,9 @@ constexpr char MenuPath[] = "sdmc:/hbmenu.nro";
 constexpr char CleanupStatusPath[] = "/kaihen/nro-cleanup.txt";
 // Where a shared library is looked for after the program's own directory.
 constexpr char LibraryDirectory[] = "sdmc:/kaihen/lib";
+// The shared libraries of this directory are loaded into every dynamically
+// linked program, as Linux's LD_PRELOAD does; see loadPreloads.
+constexpr char PreloadDirectory[] = "sdmc:/kaihen/preload";
 constexpr size_t LoaderHeapBytes = 64 * 1024 * 1024;
 constexpr size_t PageSize = 0x1000;
 // The syscalls that the game's policy allows (the ACI0 kernel capabilities of
@@ -329,6 +332,85 @@ Result loadLibraries(CleanPlatform* platform) {
     return 0;
 }
 
+// True for the file name of a shared library: one with ".so" at its end or
+// before a version, as libname.so.1. Other files of the directory, such as
+// notes, are not loaded.
+bool isLibraryName(const char* name) {
+    const char* const suffix = std::strstr(name, ".so");
+    return suffix != nullptr && (suffix[3] == '\0' || suffix[3] == '.');
+}
+
+// Loads the shared libraries of PreloadDirectory in the order of their
+// names. They come after the program and before the libraries it needs, so
+// that a function they define takes the place of a library's for every
+// module that calls it by name; libounce's dlsym(RTLD_NEXT) gives them the
+// one they replaced. A library that cannot be loaded stops the program from
+// starting, with its name in the cleanup record. To turn one off, move it
+// out of the directory. No directory means no such libraries.
+Result loadPreloads(CleanPlatform* platform) {
+    constexpr size_t NameSize = 256;
+    FsDir directory = {};
+    if (R_FAILED(fsFsOpenDirectory(&platform->sd, PreloadDirectory + std::strlen("sdmc:"),
+                                   FsDirOpenMode_ReadFiles, &directory))) {
+        return 0;
+    }
+
+    char (*names)[NameSize] = nullptr;
+    u32 count = 0;
+    u32 capacity = 0;
+    Result rc = 0;
+    for (;;) {
+        static FsDirectoryEntry entry;
+        s64 read = 0;
+        rc = fsDirRead(&directory, &read, 1, &entry);
+        if (R_FAILED(rc) || read == 0) {
+            break;
+        }
+        if (entry.type != FsDirEntryType_File || !isLibraryName(entry.name) ||
+            std::strlen(entry.name) >= NameSize) {
+            continue;
+        }
+        if (count == capacity) {
+            capacity = capacity != 0 ? capacity * 2 : 8;
+            auto* const grown = static_cast<char (*)[NameSize]>(std::realloc(names, capacity * NameSize));
+            if (grown == nullptr) {
+                rc = MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
+                break;
+            }
+            names = grown;
+        }
+        std::snprintf(names[count++], NameSize, "%s", entry.name);
+    }
+    fsDirClose(&directory);
+
+    // The order of the names is the order of the libraries.
+    for (u32 index = 1; R_SUCCEEDED(rc) && index < count; index++) {
+        char moved[NameSize];
+        std::memcpy(moved, names[index], NameSize);
+        u32 position = index;
+        for (; position != 0 && std::strcmp(names[position - 1], moved) > 0; position--) {
+            std::memcpy(names[position], names[position - 1], NameSize);
+        }
+        std::memcpy(names[position], moved, NameSize);
+    }
+
+    for (u32 index = 0; R_SUCCEEDED(rc) && index < count; index++) {
+        char path[HBLOADER_NEXT_PATH_BYTES];
+        std::snprintf(path, sizeof(path), "%s/%s", PreloadDirectory, names[index]);
+        u64 size = 0;
+        rc = loadImage(platform, path, &size);
+        if (R_SUCCEEDED(rc) && g_images.parsed[g_images.count - 1].soname == nullptr) {
+            rc = MAKERESULT(Module_Libnx, LibnxError_BadInput);
+        }
+        if (R_FAILED(rc)) {
+            std::snprintf(g_images.message, sizeof(g_images.message),
+                          "preload library %.180s could not be loaded: 0x%x", names[index], rc);
+        }
+    }
+    std::free(names);
+    return rc;
+}
+
 // Loads a program and, when it is dynamically linked, its shared libraries.
 // The entry of a dynamically linked program is its runtime library's.
 Result loadProgram(CleanPlatform* platform, const char* path, u64* out_entry) {
@@ -351,7 +433,10 @@ Result loadProgram(CleanPlatform* platform, const char* path, u64* out_entry) {
         return 0;
     }
 
-    rc = loadLibraries(platform);
+    rc = loadPreloads(platform);
+    if (R_SUCCEEDED(rc)) {
+        rc = loadLibraries(platform);
+    }
     if (R_FAILED(rc)) {
         return rc;
     }
