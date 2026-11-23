@@ -21,7 +21,7 @@ constexpr char MenuPath[] = "sdmc:/hbmenu.nro";
 // What the last NRO left behind; see checkAfterReturn.
 constexpr char CleanupStatusPath[] = "/kaihen/nro-cleanup.txt";
 // Where a shared library is looked for after the program's own directory.
-constexpr char LibraryDirectory[] = "/kaihen/lib";
+constexpr char LibraryDirectory[] = "sdmc:/kaihen/lib";
 constexpr size_t LoaderHeapBytes = 64 * 1024 * 1024;
 constexpr size_t PageSize = 0x1000;
 // The syscalls that the game's policy allows (the ACI0 kernel capabilities of
@@ -167,6 +167,11 @@ struct ProgramImages {
     // not load a library.
     DynlinkLoadInfo info;
     char message[256];
+    // The directories where the program's libraries are looked for, in
+    // order: the program's own, then LibraryDirectory. The runtime library
+    // gets them for the libraries that the program loads itself.
+    char program_directory[HBLOADER_NEXT_PATH_BYTES + 8];
+    const char* directories[2];
 };
 ProgramImages g_images;
 
@@ -262,26 +267,31 @@ bool isFile(FsFileSystem* sd, const char* path) {
     return R_SUCCEEDED(fsFsGetEntryType(sd, path, &type)) && type == FsDirEntryType_File;
 }
 
+// Sets the directories where the libraries of a program are looked for.
+void setLibraryDirectories(const char* program_path) {
+    const char* const path = std::strncmp(program_path, "sdmc:", 5) == 0 ? program_path + 5 : program_path;
+    const char* const name = std::strrchr(path, '/');
+    std::snprintf(g_images.program_directory, sizeof(g_images.program_directory), "sdmc:%.*s",
+                  name != nullptr ? static_cast<int>(name - path) : 0, path);
+    g_images.directories[0] = g_images.program_directory;
+    g_images.directories[1] = LibraryDirectory;
+}
+
 // Finds the file of a shared library, which is named by the library's
-// DT_SONAME: in the program's directory, then in LibraryDirectory.
+// DT_SONAME, in the library directories.
 bool findLibrary(CleanPlatform* platform, const char* soname, char* path, size_t path_size) {
     if (soname[0] == '\0' || std::strchr(soname, '/') != nullptr) {
         return false;
     }
-    const char* program = platform->loaded_path;
-    if (std::strncmp(program, "sdmc:", 5) == 0) {
-        program += 5;
-    }
-    const char* const name = std::strrchr(program, '/');
-    if (name != nullptr) {
-        const int length = std::snprintf(path, path_size, "%.*s/%s",
-                                         static_cast<int>(name - program), program, soname);
-        if (length > 0 && static_cast<size_t>(length) < path_size && isFile(&platform->sd, path)) {
+    for (const char* directory : g_images.directories) {
+        const int length = std::snprintf(path, path_size, "%s/%s", directory, soname);
+        // The filesystem takes the path without the device name.
+        if (length > 0 && static_cast<size_t>(length) < path_size &&
+            isFile(&platform->sd, path + std::strlen("sdmc:"))) {
             return true;
         }
     }
-    const int length = std::snprintf(path, path_size, "%s/%s", LibraryDirectory, soname);
-    return length > 0 && static_cast<size_t>(length) < path_size && isFile(&platform->sd, path);
+    return false;
 }
 
 // Loads the shared libraries that the loaded images need, and the ones those
@@ -349,7 +359,8 @@ Result loadProgram(CleanPlatform* platform, const char* path, u64* out_entry) {
         if (g_images.parsed[index].runtime_entry != 0) {
             *out_entry = g_images.parsed[index].runtime_entry;
             g_images.info = DynlinkLoadInfo{g_images.loaded, g_images.count,
-                                            sizeof(g_images.message), g_images.message};
+                                            sizeof(g_images.message), g_images.message,
+                                            g_images.directories, 2};
             return 0;
         }
     }
@@ -367,6 +378,7 @@ Result mapImage(void* opaque, const char* path, HbloaderMappedImage* out) {
     g_images.count = 0;
     g_images.info = DynlinkLoadInfo{};
     g_images.message[0] = '\0';
+    setLibraryDirectories(path);
     platform->occupied = 0;
 
     u64 entry = 0;
