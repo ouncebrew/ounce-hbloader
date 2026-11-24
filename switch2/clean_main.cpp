@@ -2,6 +2,7 @@
 // Game-role NRO loader. The entry/config cycle follows nx-hbloader at
 // 82b95122c5ae8dc059bf23893ba7623c72c86773; see ../LICENSE.md.
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include <switch.h>
@@ -19,6 +20,11 @@ namespace {
 constexpr char MenuPath[] = "sdmc:/hbmenu.nro";
 // What the last NRO left behind; see checkAfterReturn.
 constexpr char CleanupStatusPath[] = "/kaihen/nro-cleanup.txt";
+// Where a shared library is looked for after the program's own directory.
+constexpr char LibraryDirectory[] = "sdmc:/kaihen/lib";
+// The shared libraries of this directory are loaded into every dynamically
+// linked program, as Linux's LD_PRELOAD does; see loadPreloads.
+constexpr char PreloadDirectory[] = "sdmc:/kaihen/preload";
 constexpr size_t LoaderHeapBytes = 64 * 1024 * 1024;
 constexpr size_t PageSize = 0x1000;
 // The syscalls that the game's policy allows (the ACI0 kernel capabilities of
@@ -125,7 +131,6 @@ struct CleanPlatform {
     u8* staging = nullptr;
     size_t capacity = 0;
     size_t occupied = 0;
-    u64 mapped_entry = 0;
 
     ~CleanPlatform() {
         if (nro_root != INVALID_HANDLE) {
@@ -146,35 +151,343 @@ struct CleanPlatform {
     }
 };
 
-Result mapImage(void* opaque, const char* path, HbloaderMappedImage* out) {
-    auto* platform = static_cast<CleanPlatform*>(opaque);
-    std::snprintf(platform->loaded_path, sizeof(platform->loaded_path), "%s", path);
+//-----------------------------------------------------------------------------
+// The images of a program
+//-----------------------------------------------------------------------------
+
+// The images of the program that runs now: the program itself, then, for a
+// dynamically linked program, the shared libraries it needs, breadth-first.
+// libounce's runtime library (libounce.so) links them; see its dynlink.h.
+struct ProgramImages {
+    // Two arrays of the same length, which grow as a program needs more
+    // libraries: the images, and what the loader read from each.
+    DynlinkLoadedModule* loaded;
+    DynlinkModule* parsed;
+    u32 count;
+    u32 capacity;
+    // What the runtime library gets: the images, and the buffer where it
+    // writes why linking failed. The loader also writes there why it could
+    // not load a library.
+    DynlinkLoadInfo info;
+    char message[256];
+    // The directories where the program's libraries are looked for, in
+    // order: the program's own, then LibraryDirectory. The runtime library
+    // gets them for the libraries that the program loads itself.
+    char program_directory[HBLOADER_NEXT_PATH_BYTES + 8];
+    const char* directories[2];
+};
+ProgramImages g_images;
+
+// Makes room for one more image in the two arrays. False when the loader has
+// no memory for them.
+bool reserveImage() {
+    if (g_images.count < g_images.capacity) {
+        return true;
+    }
+    const u32 capacity = g_images.capacity != 0 ? g_images.capacity * 2 : 16;
+    auto* const loaded = static_cast<DynlinkLoadedModule*>(
+        std::realloc(g_images.loaded, capacity * sizeof(DynlinkLoadedModule)));
+    if (loaded == nullptr) {
+        return false;
+    }
+    g_images.loaded = loaded;
+    auto* const parsed = static_cast<DynlinkModule*>(
+        std::realloc(g_images.parsed, capacity * sizeof(DynlinkModule)));
+    if (parsed == nullptr) {
+        return false;
+    }
+    g_images.parsed = parsed;
+    g_images.capacity = capacity;
+    return true;
+}
+
+// Reads an NRO file into the staging memory after the images that are
+// already there, and maps it. The image's size without its BSS is in
+// out_size.
+Result loadImage(CleanPlatform* platform, const char* path, u64* out_size) {
+    if (!reserveImage()) {
+        return MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
+    }
+    u8* const staging = platform->staging + platform->occupied;
+    const size_t capacity = platform->capacity - platform->occupied;
     NroHeader header = {};
-    Result rc = readImage(&platform->sd, path, platform->staging, platform->capacity, &header);
+    Result rc = readImage(&platform->sd, path, staging, capacity, &header);
     if (R_FAILED(rc)) {
         return rc;
     }
+    const size_t occupied = pageAlign(static_cast<size_t>(header.size) + header.bss_size);
+    if (occupied >= capacity) {
+        return MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
+    }
+    std::memset(staging + header.size, 0, header.bss_size);
+
+    u64 base = 0;
+    rc = ldrRoLoadNro(&base, reinterpret_cast<u64>(staging), header.size,
+                      reinterpret_cast<u64>(staging + header.size), header.bss_size);
+    if (R_FAILED(rc)) {
+        return rc;
+    }
+    platform->occupied += occupied;
+
+    // A statically linked program has no dynamic symbols to parse: it stays
+    // a module that needs no library.
+    const u64 size = static_cast<u64>(header.size) + header.bss_size;
+    DynlinkModule* const parsed = &g_images.parsed[g_images.count];
+    if (R_FAILED(dynlinkModuleOpen(parsed, reinterpret_cast<const void*>(base), size))) {
+        *parsed = DynlinkModule{};
+    }
+    g_images.loaded[g_images.count] = DynlinkLoadedModule{base, size};
+    g_images.count++;
+    *out_size = header.size;
+    return 0;
+}
+
+// NROs that a program mapped itself and left: for the last program, and for
+// all programs of this process. RO unloaded them with the loader's own.
+u32 g_last_left_images = 0;
+u32 g_left_images = 0;
+
+// Unloads every NRO of the loader's RO session with one command: the
+// program, the libraries that the loader mapped for it, and the ones that
+// the program mapped itself and did not unload. The program uses the
+// loader's session, so RO has them all in one list. An image that RO cannot
+// unmap stays mapped, and the result is that failure.
+// @param[out] out_unloaded The number of NROs that RO unloaded.
+Result unloadImages(u64* out_unloaded) {
+    const u64 pid_placeholder = 0;
+    *out_unloaded = 0;
+    const Result rc = serviceDispatchInOut(ldrRoGetServiceSession(),
+                                           KaihenRoCommand_ReleaseNros,
+                                           pid_placeholder, *out_unloaded, .in_send_pid = true);
+    g_images.count = 0;
+    return rc;
+}
+
+bool isLibraryLoaded(const char* soname) {
+    for (u32 index = 0; index < g_images.count; index++) {
+        const char* loaded = g_images.parsed[index].soname;
+        if (loaded != nullptr && std::strcmp(loaded, soname) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool isFile(FsFileSystem* sd, const char* path) {
+    FsDirEntryType type = FsDirEntryType_Dir;
+    return R_SUCCEEDED(fsFsGetEntryType(sd, path, &type)) && type == FsDirEntryType_File;
+}
+
+// Sets the directories where the libraries of a program are looked for.
+void setLibraryDirectories(const char* program_path) {
+    const char* const path = std::strncmp(program_path, "sdmc:", 5) == 0 ? program_path + 5 : program_path;
+    const char* const name = std::strrchr(path, '/');
+    std::snprintf(g_images.program_directory, sizeof(g_images.program_directory), "sdmc:%.*s",
+                  name != nullptr ? static_cast<int>(name - path) : 0, path);
+    g_images.directories[0] = g_images.program_directory;
+    g_images.directories[1] = LibraryDirectory;
+}
+
+// Finds the file of a shared library, which is named by the library's
+// DT_SONAME, in the library directories.
+bool findLibrary(CleanPlatform* platform, const char* soname, char* path, size_t path_size) {
+    if (soname[0] == '\0' || std::strchr(soname, '/') != nullptr) {
+        return false;
+    }
+    for (const char* directory : g_images.directories) {
+        const int length = std::snprintf(path, path_size, "%s/%s", directory, soname);
+        // The filesystem takes the path without the device name.
+        if (length > 0 && static_cast<size_t>(length) < path_size &&
+            isFile(&platform->sd, path + std::strlen("sdmc:"))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Loads the shared libraries that the loaded images need, and the ones those
+// need. Each image is examined once, in the order it was loaded, so the
+// libraries are in breadth-first order. A failure is one of libounce's
+// results for a program that did not start (dynlink.h), which the menu shows:
+// the reason, with the library's name, is in the message.
+Result loadLibraries(CleanPlatform* platform) {
+    for (u32 index = 0; index < g_images.count; index++) {
+        for (u32 needed = 0; needed < g_images.parsed[index].needed_count; needed++) {
+            const char* const soname = dynlinkModuleGetNeeded(&g_images.parsed[index], needed);
+            if (isLibraryLoaded(soname)) {
+                continue;
+            }
+            char path[HBLOADER_NEXT_PATH_BYTES];
+            if (!findLibrary(platform, soname, path, sizeof(path))) {
+                std::snprintf(g_images.message, sizeof(g_images.message),
+                              "shared library not found: %s", soname);
+                return DYNLINK_RESULT_LIBRARY_NOT_FOUND;
+            }
+            u64 size = 0;
+            const Result rc = loadImage(platform, path, &size);
+            if (R_FAILED(rc)) {
+                std::snprintf(g_images.message, sizeof(g_images.message),
+                              "shared library %s could not be loaded: 0x%x", soname, rc);
+                return DYNLINK_RESULT_LIBRARY_NOT_LOADED;
+            }
+            // The file must be the library it is named for, or the search
+            // above would load it again for the next module that needs it.
+            if (!isLibraryLoaded(soname)) {
+                std::snprintf(g_images.message, sizeof(g_images.message),
+                              "the file of shared library %s has another DT_SONAME", soname);
+                return DYNLINK_RESULT_LIBRARY_NOT_LOADED;
+            }
+        }
+    }
+    return 0;
+}
+
+// True for the file name of a shared library: one with ".so" at its end or
+// before a version, as libname.so.1. Other files of the directory, such as
+// notes, are not loaded.
+bool isLibraryName(const char* name) {
+    const char* const suffix = std::strstr(name, ".so");
+    return suffix != nullptr && (suffix[3] == '\0' || suffix[3] == '.');
+}
+
+// Loads the shared libraries of PreloadDirectory in the order of their
+// names. They come after the program and before the libraries it needs, so
+// that a function they define takes the place of a library's for every
+// module that calls it by name; libounce's dlsym(RTLD_NEXT) gives them the
+// one they replaced. A library that cannot be loaded stops the program from
+// starting, with its name in the cleanup record. To turn one off, move it
+// out of the directory. No directory means no such libraries.
+Result loadPreloads(CleanPlatform* platform) {
+    constexpr size_t NameSize = 256;
+    FsDir directory = {};
+    if (R_FAILED(fsFsOpenDirectory(&platform->sd, PreloadDirectory + std::strlen("sdmc:"),
+                                   FsDirOpenMode_ReadFiles, &directory))) {
+        return 0;
+    }
+
+    char (*names)[NameSize] = nullptr;
+    u32 count = 0;
+    u32 capacity = 0;
+    Result rc = 0;
+    for (;;) {
+        static FsDirectoryEntry entry;
+        s64 read = 0;
+        rc = fsDirRead(&directory, &read, 1, &entry);
+        if (R_FAILED(rc) || read == 0) {
+            break;
+        }
+        if (entry.type != FsDirEntryType_File || !isLibraryName(entry.name) ||
+            std::strlen(entry.name) >= NameSize) {
+            continue;
+        }
+        if (count == capacity) {
+            capacity = capacity != 0 ? capacity * 2 : 8;
+            auto* const grown = static_cast<char (*)[NameSize]>(std::realloc(names, capacity * NameSize));
+            if (grown == nullptr) {
+                rc = MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
+                break;
+            }
+            names = grown;
+        }
+        std::snprintf(names[count++], NameSize, "%s", entry.name);
+    }
+    fsDirClose(&directory);
+
+    // The order of the names is the order of the libraries.
+    for (u32 index = 1; R_SUCCEEDED(rc) && index < count; index++) {
+        char moved[NameSize];
+        std::memcpy(moved, names[index], NameSize);
+        u32 position = index;
+        for (; position != 0 && std::strcmp(names[position - 1], moved) > 0; position--) {
+            std::memcpy(names[position], names[position - 1], NameSize);
+        }
+        std::memcpy(names[position], moved, NameSize);
+    }
+
+    for (u32 index = 0; R_SUCCEEDED(rc) && index < count; index++) {
+        char path[HBLOADER_NEXT_PATH_BYTES];
+        std::snprintf(path, sizeof(path), "%s/%s", PreloadDirectory, names[index]);
+        u64 size = 0;
+        rc = loadImage(platform, path, &size);
+        if (R_SUCCEEDED(rc) && g_images.parsed[g_images.count - 1].soname == nullptr) {
+            rc = MAKERESULT(Module_Libnx, LibnxError_BadInput);
+        }
+        if (R_FAILED(rc)) {
+            std::snprintf(g_images.message, sizeof(g_images.message),
+                          "preload library %.180s could not be loaded: 0x%x", names[index], rc);
+            rc = DYNLINK_RESULT_PRELOAD_NOT_LOADED;
+        }
+    }
+    std::free(names);
+    return rc;
+}
+
+// Loads a program and, when it is dynamically linked, its shared libraries.
+// The entry of a dynamically linked program is its runtime library's.
+Result loadProgram(CleanPlatform* platform, const char* path, u64* out_entry) {
+    u64 size = 0;
+    Result rc = loadImage(platform, path, &size);
+    if (R_FAILED(rc)) {
+        return rc;
+    }
+    const u64 base = g_images.loaded[0].base;
 
     // libounce's startup code marks the platform an NRO was built for, as
     // hbmenu checks before a launch. Upstream libnx programs have no mark.
     NroOunceInfo ounce = {};
     platform->switch2_program =
-        nroGetOunceInfo(platform->staging, header.size, &ounce) &&
+        nroGetOunceInfo(reinterpret_cast<const void*>(base), size, &ounce) &&
         ounce.platform == NroPlatform_Switch2;
-    platform->occupied = pageAlign(static_cast<size_t>(header.size) + header.bss_size);
-    if (platform->occupied >= platform->capacity) {
-        return MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
-    }
-    std::memset(platform->staging + header.size, 0, header.bss_size);
 
-    rc = ldrRoLoadNro(&platform->mapped_entry, reinterpret_cast<u64>(platform->staging),
-                      header.size, reinterpret_cast<u64>(platform->staging + header.size),
-                      header.bss_size);
-    if (R_SUCCEEDED(rc)) {
-        out->entry = platform->mapped_entry;
-        out->owner = platform;
+    *out_entry = base;
+    if (g_images.parsed[0].needed_count == 0) {
+        return 0;
     }
-    return rc;
+
+    rc = loadPreloads(platform);
+    if (R_SUCCEEDED(rc)) {
+        rc = loadLibraries(platform);
+    }
+    if (R_FAILED(rc)) {
+        return rc;
+    }
+    for (u32 index = 1; index < g_images.count; index++) {
+        if (g_images.parsed[index].runtime_entry != 0) {
+            *out_entry = g_images.parsed[index].runtime_entry;
+            g_images.info = DynlinkLoadInfo{g_images.loaded, g_images.count,
+                                            sizeof(g_images.message), g_images.message,
+                                            g_images.directories, 2};
+            return 0;
+        }
+    }
+    std::snprintf(g_images.message, sizeof(g_images.message),
+                  "none of the program's shared libraries is the runtime library (libounce.so)");
+    return DYNLINK_RESULT_NO_RUNTIME_LIBRARY;
+}
+
+void writeLoadFailure(FsFileSystem* sd, const char* program, Result rc);
+
+Result mapImage(void* opaque, const char* path, HbloaderMappedImage* out) {
+    auto* platform = static_cast<CleanPlatform*>(opaque);
+    std::snprintf(platform->loaded_path, sizeof(platform->loaded_path), "%s", path);
+    // The arrays keep their memory from one program to the next.
+    g_images.count = 0;
+    g_images.info = DynlinkLoadInfo{};
+    g_images.message[0] = '\0';
+    setLibraryDirectories(path);
+    platform->occupied = 0;
+
+    u64 entry = 0;
+    const Result rc = loadProgram(platform, path, &entry);
+    if (R_FAILED(rc)) {
+        writeLoadFailure(&platform->sd, path, rc);
+        u64 unloaded = 0;
+        unloadImages(&unloaded);
+        return rc;
+    }
+    out->entry = entry;
+    out->owner = platform;
+    return 0;
 }
 
 //-----------------------------------------------------------------------------
@@ -281,6 +594,11 @@ void writeCleanupStatus(FsFileSystem* sd, const char* program, const HbloaderLea
     if (length > 0 && length < static_cast<int>(sizeof(text)) && g_exit_reason[0] != '\0') {
         length += std::snprintf(text + length, sizeof(text) - length, "%s\n", g_exit_reason);
     }
+    // The runtime library returned without calling the program's main.
+    if (length > 0 && length < static_cast<int>(sizeof(text)) && g_images.message[0] != '\0') {
+        length += std::snprintf(text + length, sizeof(text) - length,
+                                "the program did not start: %s\n", g_images.message);
+    }
     if (length > 0 && length < static_cast<int>(sizeof(text)) && g_last_parked_threads != 0) {
         length += std::snprintf(text + length, sizeof(text) - length,
             "threads the program left running (paused by the loader): %u, %u in this process; "
@@ -294,10 +612,35 @@ void writeCleanupStatus(FsFileSystem* sd, const char* program, const HbloaderLea
             "ended threads the program did not close (released by the loader): %u\n",
             g_closed_thread_handles);
     }
+    if (length > 0 && length < static_cast<int>(sizeof(text)) && g_left_images != 0) {
+        length += std::snprintf(text + length, sizeof(text) - length,
+            "shared libraries the program left loaded (unloaded by the loader): %u, %u in this process\n",
+            g_last_left_images, g_left_images);
+    }
     if (length <= 0 || length >= static_cast<int>(sizeof(text))) {
         return;
     }
 
+    fsFsDeleteFile(sd, CleanupStatusPath);
+    if (R_FAILED(fsFsCreateFile(sd, CleanupStatusPath, length, 0))) {
+        return;
+    }
+    FsFile file = {};
+    if (R_SUCCEEDED(fsFsOpenFile(sd, CleanupStatusPath, FsOpenMode_Write, &file))) {
+        fsFileWrite(&file, 0, text, length, FsWriteOption_Flush);
+        fsFileClose(&file);
+    }
+}
+
+// Replaces the cleanup record with the reason that a program was not loaded.
+void writeLoadFailure(FsFileSystem* sd, const char* program, Result rc) {
+    char text[1024];
+    const int length = std::snprintf(text, sizeof(text),
+        "program: %s\nresult: not loaded (0x%x)\n%s%s",
+        program, rc, g_images.message, g_images.message[0] != '\0' ? "\n" : "");
+    if (length <= 0 || length >= static_cast<int>(sizeof(text))) {
+        return;
+    }
     fsFsDeleteFile(sd, CleanupStatusPath);
     if (R_FAILED(fsFsCreateFile(sd, CleanupStatusPath, length, 0))) {
         return;
@@ -523,7 +866,7 @@ NroThreads handleNroThreads() {
     return threads;
 }
 
-Result unloadImage(void* opaque, const HbloaderMappedImage* image) {
+Result unloadImage(void* opaque, const HbloaderMappedImage*) {
     auto* platform = static_cast<CleanPlatform*>(opaque);
 
     // A returned NRO may still own threads. One that has ended but that the
@@ -568,9 +911,14 @@ Result unloadImage(void* opaque, const HbloaderMappedImage* image) {
         return rc;
     }
 
-    rc = ldrRoUnloadNro(image->entry);
+    // What RO unloads beyond the loader's own images is what the program
+    // mapped and left.
+    const u64 loaded_by_loader = g_images.count;
+    u64 unloaded = 0;
+    rc = unloadImages(&unloaded);
+    g_last_left_images = unloaded > loaded_by_loader ? static_cast<u32>(unloaded - loaded_by_loader) : 0;
+    g_left_images += g_last_left_images;
     if (R_SUCCEEDED(rc)) {
-        platform->mapped_entry = 0;
         checkAfterReturn(platform);
     }
     return rc;
@@ -610,6 +958,8 @@ Result prepareConfig(void* opaque, HbloaderConfigInput* out) {
     // No debug BSD session: the NRO is the process's only BSD client.
     out->debug_bsd_handle = INVALID_HANDLE;
     out->debug_socket = -1;
+    // The runtime library of a dynamically linked program gets the images.
+    out->modules_info = g_images.info.module_count != 0 ? reinterpret_cast<u64>(&g_images.info) : 0;
     out->heap_address = reinterpret_cast<u64>(platform->staging + platform->occupied);
     out->heap_size = platform->capacity - platform->occupied;
     out->syscall_hints[0] = GameSyscallHints[0];

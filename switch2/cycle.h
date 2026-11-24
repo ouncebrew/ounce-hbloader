@@ -48,7 +48,9 @@ typedef struct HbloaderCycleResult {
  * must use the loader stack/return trampoline; a direct C call is only
  * suitable for host tests. Its function Result reports a loader failure;
  * out_app_result is the NRO's own return value, which may be nonzero.
- * unload_image must retain its owner on failure. */
+ * unload_image must retain its owner on failure. When map_image fails for a
+ * program that the menu selected, the step succeeds without entering
+ * anything, and the next step loads the menu. */
 typedef struct HbloaderCyclePlatform {
     void *context;
     uint32_t (*map_image)(void *context, const char *path, HbloaderMappedImage *out);
